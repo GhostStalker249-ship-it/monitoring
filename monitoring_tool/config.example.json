@@ -1,0 +1,48 @@
+{
+  "cyberbackup": {
+    "host": "cyberbackup.local",
+    "port": 9877,
+    "api_version": "2",
+    "username": "admin",
+    "password": "change-me",
+    "client_id": "00000000-0000-0000-0000-000000000000",
+    "client_secret": "change-me",
+    "scope": "urn:acronis.com::resource_management::read",
+    "verify_ssl": false
+  },
+  "dashboard": {
+    "bind_host": "0.0.0.0",
+    "bind_port": 8080,
+    "refresh_seconds": 30,
+    "widgets": [
+      {
+        "title": "Всего ресурсов",
+        "type": "resources_count",
+        "params": { "limit": 200 }
+      },
+      {
+        "title": "Всего политик",
+        "type": "policies_count",
+        "params": { "limit": 100 }
+      },
+      {
+        "title": "Задачи по состояниям",
+        "type": "tasks_by_state",
+        "params": { "limit": 200 }
+      },
+      {
+        "title": "Действия по состояниям",
+        "type": "activities_by_state",
+        "params": { "limit": 200 }
+      },
+      {
+        "title": "Критичные реквизиты",
+        "type": "credentials_detail",
+        "params": {
+          "credentials_id": "replace-with-real-id",
+          "tenant_id": "replace-with-tenant-id"
+        }
+      }
+    ]
+  }
+}
