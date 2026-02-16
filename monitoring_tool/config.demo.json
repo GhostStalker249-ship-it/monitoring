@@ -1,0 +1,22 @@
+{
+  "cyberbackup": {
+    "host": "127.0.0.1",
+    "port": 1,
+    "api_version": "2",
+    "username": "demo",
+    "password": "demo",
+    "client_id": "demo",
+    "client_secret": "demo",
+    "scope": "urn:acronis.com::resource_management::read",
+    "verify_ssl": false
+  },
+  "dashboard": {
+    "bind_host": "0.0.0.0",
+    "bind_port": 8080,
+    "refresh_seconds": 5,
+    "widgets": [
+      {"title": "Ресурсы", "type": "resources_count", "params": {"limit": 10}},
+      {"title": "Задачи", "type": "tasks_by_state", "params": {"limit": 10}}
+    ]
+  }
+}
