@@ -2,7 +2,7 @@
 """Cyber Backup monitoring tool with configurable widgets.
 
 Features:
-- OAuth2 token retrieval via /idp/token
+- Explicit OAuth2 authorization and token retrieval via /idp/token
 - Data collection from /resources, /policies, /tasks, /activities, /credentials/{id}
 - JSON-based widget configuration
 - Lightweight web dashboard using only Python stdlib
@@ -18,7 +18,7 @@ import time
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, Dict, List, Optional
-from urllib.parse import parse_qsl, urlencode, urljoin
+from urllib.parse import urlencode, urljoin
 from urllib.request import Request, urlopen
 
 
@@ -57,7 +57,9 @@ class CyberBackupClient:
     def __init__(self, config: CyberBackupConfig) -> None:
         self.config = config
         self._token: Optional[str] = None
+        self._refresh_token: Optional[str] = None
         self._token_exp_at: float = 0
+        self._lock = threading.Lock()
 
     def _request_json(
         self,
@@ -75,11 +77,7 @@ class CyberBackupClient:
             body = response.read().decode("utf-8")
             return json.loads(body) if body else {}
 
-    def get_token(self) -> str:
-        now = time.time()
-        if self._token and now < self._token_exp_at:
-            return self._token
-
+    def _request_token(self) -> Dict[str, Any]:
         form = urlencode(
             {
                 "grant_type": "password",
@@ -91,18 +89,73 @@ class CyberBackupClient:
             }
         ).encode("utf-8")
 
-        token_resp = self._request_json(
+        return self._request_json(
             "POST",
             f"{self.config.token_base_url}/idp/token",
             data=form,
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
+
+    def _save_token(self, token_resp: Dict[str, Any]) -> str:
+        now = time.time()
         self._token = token_resp.get("access_token", "")
+        self._refresh_token = token_resp.get("refresh_token")
         expires_in = int(token_resp.get("expires_in", 300))
         self._token_exp_at = now + max(60, expires_in - 15)
         if not self._token:
             raise RuntimeError("Access token is empty in token response")
         return self._token
+
+    def set_auth_credentials(
+        self,
+        username: str,
+        password: str,
+        client_id: str,
+        client_secret: str,
+        scope: Optional[str] = None,
+    ) -> None:
+        with self._lock:
+            self.config.username = username
+            self.config.password = password
+            self.config.client_id = client_id
+            self.config.client_secret = client_secret
+            if scope:
+                self.config.scope = scope
+            self._token = None
+            self._refresh_token = None
+            self._token_exp_at = 0
+
+    def authenticate_explicit(self) -> Dict[str, Any]:
+        with self._lock:
+            token_resp = self._request_token()
+            token = self._save_token(token_resp)
+            return {
+                "authenticated": True,
+                "token_type": token_resp.get("token_type", "Bearer"),
+                "expires_in": int(token_resp.get("expires_in", 300)),
+                "scope": token_resp.get("scope", self.config.scope),
+                "access_token_preview": f"{token[:8]}...{token[-6:]}" if len(token) > 20 else "***",
+            }
+
+    def token_status(self) -> Dict[str, Any]:
+        with self._lock:
+            now = time.time()
+            has_token = bool(self._token and now < self._token_exp_at)
+            return {
+                "authenticated": has_token,
+                "expires_at": int(self._token_exp_at) if self._token_exp_at else 0,
+                "seconds_left": max(0, int(self._token_exp_at - now)) if self._token_exp_at else 0,
+                "scope": self.config.scope,
+                "username": self.config.username,
+            }
+
+    def get_token(self) -> str:
+        with self._lock:
+            now = time.time()
+            if self._token and now < self._token_exp_at:
+                return self._token
+            token_resp = self._request_token()
+            return self._save_token(token_resp)
 
     def _api_get(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Any:
         query = ""
@@ -243,14 +296,63 @@ def build_dashboard_html(refresh_seconds: int) -> str:
     .error {{ border-left:4px solid #ef4444; }}
     pre {{ white-space:pre-wrap; word-wrap:break-word; margin:0; }}
     .meta {{ opacity:.8; margin-bottom:12px; }}
+    .auth {{ background:#111827; padding:12px; border-radius:12px; margin-bottom:16px; }}
+    .row {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:8px; margin-bottom:8px; }}
+    input,button {{ border-radius:8px; border:1px solid #334155; background:#0b1220; color:#e2e8f0; padding:8px; }}
+    button {{ cursor:pointer; background:#1d4ed8; border-color:#1d4ed8; }}
+    button:hover {{ background:#1e40af; }}
   </style>
 </head>
 <body>
   <h1>CyberBackup Monitor</h1>
   <div class=\"meta\">Автообновление: каждые {refresh_seconds} сек.</div>
+  <div class=\"auth\">
+    <h3>Явная авторизация и получение токена</h3>
+    <div class=\"row\">
+      <input id=\"username\" placeholder=\"username\" />
+      <input id=\"password\" type=\"password\" placeholder=\"password\" />
+      <input id=\"client_id\" placeholder=\"client_id\" />
+      <input id=\"client_secret\" type=\"password\" placeholder=\"client_secret\" />
+      <input id=\"scope\" placeholder=\"scope\" />
+    </div>
+    <button onclick=\"authenticate()\">Авторизоваться и получить токен</button>
+    <div id=\"auth_status\" class=\"meta\"></div>
+  </div>
   <div id=\"updated\" class=\"meta\"></div>
   <div id=\"widgets\"></div>
   <script>
+    async function fetchAuthStatus() {{
+      const res = await fetch('/api/auth/status');
+      const payload = await res.json();
+      const text = payload.authenticated
+        ? `Токен активен, осталось ${{payload.seconds_left}} сек., пользователь: ${{payload.username}}`
+        : 'Токен отсутствует или истек';
+      document.getElementById('auth_status').innerText = text;
+    }}
+
+    async function authenticate() {{
+      const body = {{
+        username: document.getElementById('username').value,
+        password: document.getElementById('password').value,
+        client_id: document.getElementById('client_id').value,
+        client_secret: document.getElementById('client_secret').value,
+        scope: document.getElementById('scope').value,
+      }};
+      const res = await fetch('/api/auth', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify(body),
+      }});
+      const payload = await res.json();
+      if (res.ok) {{
+        document.getElementById('auth_status').innerText =
+          `Успешно: ${{payload.token_type}}, expires_in=${{payload.expires_in}}, token=${{payload.access_token_preview}}`;
+      }} else {{
+        document.getElementById('auth_status').innerText = `Ошибка авторизации: ${{payload.error || 'unknown error'}}`;
+      }}
+      await refresh();
+    }}
+
     async function refresh() {{
       const res = await fetch('/api/widgets');
       const payload = await res.json();
@@ -270,24 +372,32 @@ def build_dashboard_html(refresh_seconds: int) -> str:
         root.appendChild(card);
       }}
     }}
+    fetchAuthStatus();
     refresh();
-    setInterval(refresh, {refresh_seconds * 1000});
+    setInterval(async () => {{ await fetchAuthStatus(); await refresh(); }}, {refresh_seconds * 1000});
   </script>
 </body>
 </html>
 """
 
 
-def make_handler(state: DashboardState):
+def make_handler(state: DashboardState, client: CyberBackupClient):
     class Handler(BaseHTTPRequestHandler):
+        def _send_json(self, code: int, payload: Dict[str, Any]) -> None:
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         def do_GET(self) -> None:  # noqa: N802
             if self.path.startswith("/api/widgets"):
-                body = json.dumps(state.latest).encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+                self._send_json(200, state.latest)
+                return
+
+            if self.path.startswith("/api/auth/status"):
+                self._send_json(200, client.token_status())
                 return
 
             if self.path == "/" or self.path.startswith("/index.html"):
@@ -301,6 +411,35 @@ def make_handler(state: DashboardState):
 
             self.send_response(404)
             self.end_headers()
+
+        def do_POST(self) -> None:  # noqa: N802
+            if not self.path.startswith("/api/auth"):
+                self.send_response(404)
+                self.end_headers()
+                return
+
+            try:
+                content_length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(content_length).decode("utf-8") if content_length else "{}"
+                payload = json.loads(body)
+
+                required = ["username", "password", "client_id", "client_secret"]
+                for field in required:
+                    if not payload.get(field):
+                        self._send_json(400, {"error": f"Field '{field}' is required"})
+                        return
+
+                client.set_auth_credentials(
+                    username=str(payload["username"]),
+                    password=str(payload["password"]),
+                    client_id=str(payload["client_id"]),
+                    client_secret=str(payload["client_secret"]),
+                    scope=str(payload.get("scope", "")).strip() or None,
+                )
+                auth_payload = client.authenticate_explicit()
+                self._send_json(200, auth_payload)
+            except Exception as exc:
+                self._send_json(500, {"error": str(exc)})
 
         def log_message(self, fmt: str, *args: Any) -> None:
             return
@@ -345,7 +484,7 @@ def run_server(config: Dict[str, Any]) -> None:
 
     bind_host = dash.get("bind_host", "0.0.0.0")
     bind_port = int(dash.get("bind_port", 8080))
-    server = HTTPServer((bind_host, bind_port), make_handler(state))
+    server = HTTPServer((bind_host, bind_port), make_handler(state, client))
     print(f"CyberBackup Monitor started on http://{bind_host}:{bind_port}")
     try:
         server.serve_forever()
